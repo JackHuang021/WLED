@@ -1,16 +1,20 @@
 # ST7735 80x160 TFT display
 
-Drives a 0.96" ST7735 SPI TFT (80x160) from WLED. It shows the same information
-as the [ST7789 usermod](../ST7789_display/), re-flowed for the much smaller panel:
+Drives a 0.96" ST7735 SPI TFT (160x80, landscape) from WLED, and puts the board's
+single BOOT button to work as a control for the three things worth having without
+a phone: on/off, brightness and effect.
 
-* Current date and time;
-* Network SSID;
-* IP address, or AP IP and password while the access point is up;
-* Brightness;
-* WiFi signal strength;
-* Selected effect and palette;
-* Effect speed and intensity;
-* Estimated current in mA.
+The screen is two **persistent status bars** with a **main area** between them:
+
+* Top bar — time, date, brightness as a sun icon plus a percentage, and WiFi
+  signal strength as bars at the right edge;
+* Main area — the selected effect and palette;
+* Bottom bar — IP address (or the AP's address and password while the access
+  point is up), and the estimated current draw in mA.
+
+There is no menu: both bars are always there and the button acts directly on what
+they show. The reasoning (and the alternatives that were rejected) is in
+[docs/hmi.md](../../docs/hmi.md).
 
 ## Hardware
 
@@ -102,28 +106,139 @@ in the UI before this usermod gets a chance to claim it.
 
 The panel is mounted **landscape (160x80)**, so the rotation setting offers only 1 and
 3 — the two landscape orientations, 180° apart, so the screen can be flipped for
-mounting. Either is a runtime change (the MADCTL register is rewritten), so no rebuild
-is needed to try the other one.
+mounting. **3 is the default**; pick 1 if the picture comes up upside-down.
 
-160 px is 26 characters at text size 1, but 80 px of height is only half the height the
-portrait arrangement had, so the layout is split into two columns of 13 characters:
+Either is a runtime change — the MADCTL register is rewritten and the screen is
+repainted — so no rebuild is needed to try the other one. Note that the setting is
+**persisted**, so a value already in `cfg.json` wins over the compiled-in default:
+changing the default in the source only affects a board whose `um.ST7735` block has no
+`rotation` key yet. To flip an existing board, use the dropdown on the settings page.
 
-| left column | right column |
+160 px is 26 characters at text size 1 (6x8 GLCD font), and 80 px is ten rows. Two
+one-line status bars frame a 56 px main area:
+
+```
+   0 ┌──────────────────────────────────────────────────────────────┐
+     │ 14:32  9/19              ☀ 65%                  ▁▃▅█         │  time, date, brightness, signal
+  11 ├──────────────────────────────────────────────────────────────┤
+  26 │                        Blink                                 │  effect name, size 2
+  46 │                       Rainbow                                │  palette
+  68 ├──────────────────────────────────────────────────────────────┤
+  71 │ 192.168.1.42                                1234 mA          │  address, current draw
+  79 └──────────────────────────────────────────────────────────────┘
+```
+
+The split is by how often a value changes and who can change it. The top bar holds
+what the button edits and what moves on its own; the bottom bar holds the two
+things that are slow, wide, and only worth reading occasionally.
+
+Each bar is 11 px rather than the 8 the font needs, because the two icons on the
+top bar are 11x11. Below that size a sun cannot have both a round core and rays
+clear of it, which is what it takes to stop it reading as a cross.
+
+**Signal strength is four bars** — the one icon nobody needs a label for: 2 px
+wide with a 1 px gap, 4/6/8/10 px tall, lit from the left as `quality` crosses 25,
+50, 75 and 100. Without a link there is nothing to measure, so they are drawn in
+the trough colour rather than not drawn: the icon stays recognisable.
+
+**Brightness is a sun**, not a bar. The core is a filled disc of radius 2 and stays
+that size; the level only lengthens the rays. All eight of them are always drawn,
+one pixel clear of the core: a single pixel each up to 25% brightness, two past it,
+which takes the sun out to the edges of its 11x11 box. Leaving the four diagonals
+for a higher tier, as the first version did, put a disc with only the four axis
+rays on screen across the middle of the range — and that is a cross, not a sun. At
+zero it is a hollow ring, so "off" still reads as a brightness icon. Both icons are
+drawn from primitives rather than stored as bitmaps because the sun takes the live
+LED colour, the same one the brightness overlay's bar uses. The percentage 2 px
+away carries the value the icon can only approximate.
+
+Every field is a **fixed width**, and is cleared to that width before it is
+drawn — a value that shrinks (`192.168.1.42` → `No link`) would otherwise leave
+the tail of the longer one behind it. Long names are cut rather than wrapped
+(`textWrap` is off), because a wrapped line would print over the row below.
+
+Each region is repainted on its own, and only when something in it changed: the
+clock ticking does not disturb the effect name two rows below it. The current draw
+is the one field that changes every second; it is right-aligned so that the `mA`
+stays put while the number grows to its left.
+
+**Degraded states**, all of which are handled:
+
+| state | what changes |
 |---|---|
-| date | effect name |
-| clock (text size 2) | palette name |
-| SSID | effect speed / intensity |
-| IP address, or the AP's IP and password | estimated current in mA |
-| brightness | |
-| WiFi signal strength | |
+| station connected | address in the bottom bar in green, bars lit on the top bar |
+| access point up | address in the bottom bar turns orange and is joined by the AP password |
+| no link | `No link` in orange, no bars lit |
+| NTP off | clock shows `--:--` and the date field is left empty |
 
-Both columns are drawn on the same rows, so every line is clipped to 13 characters.
-That clipping is what stops one column printing over the other; long effect and palette
-names are cut rather than wrapped.
+The row positions, field widths and colours are one block of `#define`s and
+`static const uint16_t` near the top of
+[ST7735_display.cpp](ST7735_display.cpp), so re-flowing the arrangement is a
+matter of moving those numbers.
 
-This is a first pass at the arrangement. The row positions are one block of `#define`s
-near the top of [ST7735_display.cpp](ST7735_display.cpp), so re-flowing it is a matter
-of moving those numbers.
+## Button
+
+The board has one button (the C3's BOOT button on GPIO9), and this usermod takes
+it over. Its gestures mirror WLED's own so the timing feels the same:
+
+| gesture | action | when it fires |
+|---|---|---|
+| short press | on / off | 350 ms after release — the double-press window has to close first |
+| double press | next effect | on the second release |
+| long press | brightness, stepping every 150 ms while held | 600 ms after pressing down |
+| hold 5–10 s | start the access point | on release |
+| hold 10 s + | factory reset | on release |
+
+**Brightness direction alternates**: each long press flips it, so the first one
+brightens and the next dims. Since the sign cannot be known before pressing, the
+direction is shown **the moment the long press starts** — that is what the `+` /
+`-` next to the percentage in the main area is for. The first few steps are finer
+(4) than the rest (`hmiStep`, 16) so the bottom of the range can be set precisely.
+
+### Operation views
+
+Pressing a button replaces the main area with a view of what is being changed —
+the effect name for a double press, `ON`/`OFF` for a short press, a full-width bar
+and percentage while the brightness is adjusted. It is **not a screen you have to
+leave**: it disappears on its own 1.5 s after the last press. Nothing needs
+confirming, because every change takes effect immediately.
+
+### The escape hatches are reimplemented, not delegated
+
+`handleButton()` returning true makes `wled00/button.cpp` skip its own handling of
+button 0 **entirely** — including the 5 s AP and 10 s factory-reset holds. Those
+are reimplemented in [ui_hmi.cpp](ui_hmi.cpp) with the same thresholds.
+
+Handing the press back to WLED part-way through instead does *not* work, and it is
+worth knowing why: `button.cpp` only advances a button's press state while it owns
+that button ([button.cpp:304](../../wled00/button.cpp#L304)), so a press it has
+been ignoring looks like a **fresh** press the moment it is handed back. The
+release would then measure a duration of nearly zero and neither threshold would
+ever be reached. If you change the takeover logic, keep the escape hatches in
+`HmiGesture` — they are the only software route back from a bad Wi-Fi
+configuration, alongside holding GPIO9 down while the board resets.
+
+One consequence to be aware of: a hold that reaches the 5 s AP threshold has also
+been adjusting brightness for the previous 4.4 s, so the strip will be at full
+brightness when the AP comes up. Brightness is not persisted, so a reboot (or the
+preset that gets applied afterwards) restores it.
+
+### What is given up
+
+While the display usermod owns button 0:
+
+* The three button 0 macros on the **Time settings** page do nothing. Button
+  indices other than 0 are untouched.
+* WLED's default actions for that button — short-press toggle, long-press random
+  colour — are replaced by the table above. The random colour is the only one
+  with no direct replacement.
+* No `button/0` message is published to MQTT, because that publish lives inside
+  the handlers that no longer run. State changes still notify normally, since
+  everything here goes through `stateUpdated(CALL_MODE_BUTTON)`.
+* Effects only cycle forwards — one button has no gesture left for "previous".
+
+Set `hmi` to `false` on the usermod settings page to hand the button back to WLED
+completely; the display keeps working.
 
 ## SPI bus
 
@@ -249,8 +364,30 @@ wrong — check that `ST7735_DRIVER` is set.
 ## Limitations
 
 * **Landscape only.** The layout is drawn for 160x80, so the rotation setting offers
-  only 1 and 3. Portrait (0 or 2) would need its own row positions — a single column
-  of 13 characters over 160 px of height rather than the two columns below — and a
-  branch to pick between them, which nothing currently does.
-* The layout is a first pass and is expected to be revised — see
-  [Layout](#layout) for how it is currently arranged.
+  only 1 and 3. Portrait (0 or 2) would need its own row positions and field widths —
+  a single column of 13 characters over 160 px of height instead of two status bars
+  — and a branch to pick between them, which nothing currently does.
+* **No menu.** Effect palette, speed and intensity are not reachable from the
+  button; they need the web UI. The three gestures are spent on on/off, brightness
+  and effect selection, and they are not on screen either — see below.
+  [docs/hmi.md](../../docs/hmi.md) works through what a menu would cost and how it
+  would be added if these turn out to be needed.
+* **The SSID is no longer on screen.** The bottom bar has room for the address, not
+  the network name; it is on the settings page instead.
+* **Brightness, effect and on/off are volatile**, as they are everywhere else in
+  WLED: they survive until the next reboot unless a preset is saved. The button
+  cannot save one.
+* **The screen cannot be switched off.** With `TFT_BL` at -1 there is no backlight
+  pin to turn down, and a colour TFT's backlight is a continuous drain. The
+  automatic blanking described under [Backlight](#backlight) is a no-op on such a
+  module. If the display is meant to sit somewhere dark, this is worth solving in
+  hardware before anything else.
+* **The bottom bar is full.** Its two fields are sized for the worst case they can
+  actually reach (a 15-character IPv4 address, `65535 mA`), which leaves 16 px
+  between them. The top bar has 40 px of slack in the middle, so it is the one
+  with room to grow.
+* **The AP password displaces the current draw**, not the address: while the
+  access point is up the bottom bar becomes its address and password, because
+  joining it is the only thing anyone is doing at that moment.
+* **Speed, intensity, preset and frame rate are not on screen.** They are in the
+  web UI. The main area has the room for them if they turn out to be missed.
