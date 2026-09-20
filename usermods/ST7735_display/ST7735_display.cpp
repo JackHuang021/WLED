@@ -110,36 +110,81 @@
 #define Y_OVERLAY_BAR   (Y_MAIN + 30)   // 42 (42..49)
 
 /*
+ * The one big text that is centred on the panel rather than in the main area:
+ * the strip's ON/OFF state, in the power overlay and on the idle screen when
+ * the strip is off. It is the whole message in both places, so it is placed
+ * against the panel - (80 - 16) / 2 - rather than against the area between the
+ * two bars, which is 1 px off centre and crowds the title.
+ */
+#define Y_POWER_BIG ((PANEL_HEIGHT - 16) / 2)   // 32, text size 2 -> 16 px tall
+
+/*
  * Top bar, left to right: clock, date, then the sun with its percentage, and
- * the signal bars last. The date is five characters - "12/31" is the longest -
- * so it fits beside the clock, and the two right-hand items are laid out from
- * the edge inwards: the signal bars sit against it, the brightness pair to
- * their left.
+ * the signal bars last. The two right-hand items are laid out from the edge
+ * inwards: the signal bars sit against it, the brightness pair to their left.
  *
  * Inside that pair the gap is 2 px, the tightest on the bar: the number is the
  * sun's caption, not a field of its own, and the 4 px before the signal bars
  * are what keeps the two readings from running together.
+ *
+ * The date is ten characters with the year in it, which is what the clock and
+ * the icons leave room for: 37 + 60 = 97 px against the sun's icon at 107. It
+ * is written in a fixed YYYY-MM-DD shape rather than a "9/20" that grows to
+ * "12/31", so it is the same ten columns on every day of the year and the field
+ * beside it never has to move. No weekday: three more characters would not fit,
+ * and the day of the week is the one part of a date nobody needs on a light.
  */
 #define X_TIME       0
 #define TIME_CHARS   6                                // "14:32 " or "11:05A"
 #define X_DATE       37
-#define DATE_CHARS   5                                // "9/19" .. "12/31", no weekday
+#define DATE_CHARS   10                               // "2026-09-20"
 #define ICON_W       11                               // signal bars and sun alike
 #define ICON_H       11
 #define X_SIGNAL_ICON (PANEL_WIDTH - ICON_W)          // 149
 #define X_BRI_PCT     (X_SIGNAL_ICON - 5 - 4 * CHAR_W) // 120
 #define X_BRI_ICON    (X_BRI_PCT - 2 - ICON_W)        // 107
 
-// Bottom bar: address on the left, current draw on the right. "65535 mA" is as
-// long as the readout can get, so 9 characters covers any bus.
+/*
+ * Bottom bar. Normally: the address on the left, the current draw against the
+ * right edge. Two fields, and they must not overlap - the one drawn second
+ * paints its padding, and the font is opaque, so a field that reaches into
+ * another's columns erases the tail of it. That is what a 15-character address
+ * sitting under a right-aligned readout does: "192.168.1.42" comes out as
+ * "192.168.1." with the last three characters painted over by the spaces in
+ * front of the mA.
+ *
+ * With the address given every column an IPv4 address can need and the readout
+ * given every one a 16-bit mA figure can, there are 16 px to spare between them
+ * (90..106), and nothing else ever draws on this bar. The two static_asserts
+ * below are that arithmetic, kept where a change to either field has to walk
+ * past them.
+ */
 #define X_LINK        0
-#define LINK_CHARS    15                              // longest IPv4 address
-#define CURRENT_CHARS 9
-// While the AP is up, its address and password are the only things on the bar -
-// they are how someone joins it. 9 characters fits "4.3.2.1" with room for a
-// custom address; the password is right-aligned from x=58, so the two cannot
-// meet.
-#define AP_IP_CHARS   9
+#define LINK_CHARS    15      // "255.255.255.255" is the longest address there is - 90 px
+#define MA_CHARS       9      // "65535 mA" is the longest readout there is - 54 px
+
+/*
+ * The AP is the one screen this bar cannot fit on: its two values are the
+ * address to browse to and the password to join with, and "Pass:" plus even a
+ * short password is wider than the 54 px the readout gave up. So it is a second
+ * layout in different columns, and the bar is wiped when the two swap - once
+ * per AP session rather than once a second, and on a change the user made
+ * deliberately, which is why it can afford the clear the other layout cannot.
+ *
+ * Both of its fields are cut to fit, an address of the lengths WLED hands out
+ * ("4.3.2.1", "192.168.4.1") and the default "wled1234" password with room to
+ * spare. A longer password is cut like any other over-long string; it is also
+ * on the settings page, which is where someone who has to join this way ends up
+ * anyway.
+ */
+#define AP_IP_CHARS   11      // "192.168.4.1" - 66 px
+#define X_AP_PASS     (PANEL_WIDTH - AP_PASS_CHARS * CHAR_W)  // 70
+#define AP_PASS_CHARS 15      // "Pass:" and ten characters of password - 90 px
+
+static_assert(X_LINK + LINK_CHARS * CHAR_W <= PANEL_WIDTH - MA_CHARS * CHAR_W,
+              "bottom bar: the readout is drawn over the address");
+static_assert(X_LINK + AP_IP_CHARS * CHAR_W <= X_AP_PASS,
+              "bottom bar: the AP password is drawn over the AP address");
 
 // Brightness overlay: direction sign sits between the title and the percentage.
 // The overlay keeps its value against the right edge; only the top bar gave that
@@ -267,15 +312,51 @@ class St7735DisplayUsermod : public Usermod {
     bool dirtyMain = true;
     bool fullMainRedraw = true;    // repaint the whole main area, not just a field
 
+    /*
+     * What each text field last put on the panel, so an unchanged one is not
+     * repainted. This is the anti-flicker half of how fields are drawn: the
+     * panel has no framebuffer, so the only way to back out a wrong value is to
+     * clear the field and write the right one, and a field measured in seconds
+     * (the current draw) is cleared most of the times it is drawn even when the
+     * number that changed is one digit.
+     *
+     * The rect is kept as well as the key so that a wipe can find the fields it
+     * covered, and so that a field being recorded displaces any other one it
+     * overlaps: two fields that share pixels cannot both be on the panel, and
+     * the one that has just been written is the one that is. Without that,
+     * whatever the wipe missed would be skipped as already drawn, which is how
+     * a field goes missing rather than merely flickering. Every fillScreen()
+     * has to call resetFieldCache().
+     */
+    struct FieldCache {
+      uint32_t key;    // x, y and height; 0 means the slot is free
+      int16_t  x, y;   // the rect the field covers - what a wipe is tested against
+      uint8_t  w, h;
+      uint16_t color;
+      char     text[LINE_BUFFER_SIZE];
+    };
+    static const uint8_t FIELD_CACHE_ENTRIES = 12;
+    FieldCache fieldCache[FIELD_CACHE_ENTRIES];
+
     // Last values painted, so we can tell what actually changed.
     IPAddress knownIp;
     bool     knownApActive = false;
     int16_t  knownQuality = -2;    // -1 = no link, -2 = never sampled
     uint8_t  knownBrightness = 255;
+    // The last brightness that was not zero. Switching the strip off drops bri
+    // to 0, and the sun is a picture of the level rather than of the power
+    // state, so it keeps the level the strip would come back on at while the
+    // percentage beside it reads 0%.
+    uint8_t  lastNonZeroBri = 255;
     uint8_t  knownMinute = 99;
     uint8_t  knownHour = 99;
     uint8_t  knownMonth = 99;
     uint8_t  knownDay = 99;
+    uint16_t knownYear = 0;
+    // Which of the bottom bar's two layouts is on screen. Unknown until one of
+    // them has been drawn, because until then there is nothing to wipe.
+    bool     bottomLayoutKnown = false;
+    bool     bottomIsAp = false;
     uint16_t knownMilliamps = 0xFFFF;  // BusManager::currentMilliamps() is 16-bit
     uint8_t  knownMode = 0;
     uint8_t  knownPalette = 0;
@@ -285,6 +366,7 @@ class St7735DisplayUsermod : public Usermod {
     uint8_t  mainMode = 255, mainPalette = 255;
     bool     mainOff = false;
     bool     mainDrawn = false;    // nothing has been painted yet
+    int16_t  brightnessBarWidth = 0;   // width last painted in the brightness bar
 
     /*
      * Copy at most `max` characters, always terminating. The panel and the GLCD
@@ -298,54 +380,206 @@ class St7735DisplayUsermod : public Usermod {
     }
 
     /*
-     * One fixed-width field. The whole field is cleared, not just the text: a
-     * value that shrinks ("192.168.1.42" -> "No link") would otherwise leave the
-     * tail of the longer one behind it.
-     *
-     * Takes a plain C string rather than the F() macro other calls in this file
-     * use - a flash string would have to be copied into a RAM String to get here,
-     * and the brightness readout redraws these several times a second.
+     * Copy `chars` characters of `text` into `dst` and pad with spaces to the
+     * full field width. The GLCD font is 6x8 with an opaque background, so a
+     * padded string is the whole field: a value that shrinks ("192.168.1.42" ->
+     * "No link") overwrites its tail, and the padded string is what
+     * fieldChanged() compares, so what is shown is what is remembered.
      */
-    void drawField(const char *text, int16_t x, int16_t y, uint8_t chars, uint16_t color) {
-      char field[LINE_BUFFER_SIZE];
-      clip(text, field, chars);
-      tft.fillRect(x, y, chars * CHAR_W, ROW_H, HMI_C_BG);
+    static void clipPadded(const char *text, char *dst, uint8_t chars) {
+      uint8_t i = 0;
+      while (i < chars && text[i]) { dst[i] = text[i]; i++; }
+      while (i < chars) dst[i++] = ' ';
+      dst[i] = '\0';
+    }
+
+    /*
+     * The same, padded in front instead. A right-aligned field is one whose
+     * *last* character is pinned to the edge, so a value that changes length -
+     * "45 mA" today, "1200 mA" tomorrow - has to grow leftwards; padding behind
+     * it would only pin the first character and leave the reading floating in
+     * the middle of the screen.
+     */
+    static void clipPaddedLeft(const char *text, char *dst, uint8_t chars) {
+      uint8_t len = 0;
+      while (len < chars && text[len]) len++;
+      uint8_t pad = chars - len;
+      for (uint8_t i = 0; i < pad; i++) dst[i] = ' ';
+      for (uint8_t i = 0; i < len; i++) dst[pad + i] = text[i];
+      dst[chars] = '\0';
+    }
+
+    // Two rectangles overlap when each starts before the other ends, so a field
+    // that ends at the pixel another starts on is in the clear.
+    static bool overlaps(int16_t ax, int16_t ay, int16_t aw, int16_t ah,
+                         int16_t bx, int16_t by, int16_t bw, int16_t bh) {
+      return ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah;
+    }
+
+    /*
+     * True when the field at (x, y) no longer reads what the panel shows there,
+     * and records `text` as its new content either way. The panel has no
+     * framebuffer, so a field's own record of what it wrote is the only way to
+     * tell an unchanged one, which needs no repaint, from a changed one.
+     *
+     * The rect is what the field paints, not a measurement of its text: the two
+     * have to agree, because anything the rect misses is a field the cache would
+     * hold on to after a wipe had taken it off the panel.
+     */
+    bool fieldChanged(int16_t x, int16_t y, int16_t w, int16_t h, const char *text, uint16_t color) {
+      // x in the low byte, the height in the next - no field is 0 px tall - and
+      // y above that. No field has a key of 0, which is the empty slot.
+      uint32_t key = (uint32_t)(uint16_t)x | ((uint32_t)(uint16_t)h << 8) | ((uint32_t)(uint16_t)y << 16);
+
+      for (uint8_t i = 0; i < FIELD_CACHE_ENTRIES; i++) {
+        FieldCache &entry = fieldCache[i];
+        if (entry.key != key) continue;
+        if (entry.color == color && strcmp(entry.text, text) == 0) return false;
+        entry.color = color;
+        strcpy(entry.text, text);
+        return true;
+      }
+
+      // Not on the panel yet, so there is nothing to compare against. Whatever
+      // is in the way goes first: two fields that share pixels cannot both be on
+      // the panel, and this is the one being written, so holding on to the other
+      // would have it skip a repaint its pixels still need.
+      for (uint8_t i = 0; i < FIELD_CACHE_ENTRIES; i++) {
+        FieldCache &entry = fieldCache[i];
+        if (entry.key == 0) continue;
+        if (overlaps(x, y, w, h, entry.x, entry.y, entry.w, entry.h)) entry.key = 0;
+      }
+
+      // A slot is always free - there are more of them than there are fields any
+      // one layout can put up - but if one ever is not, the draw still happens
+      // and this field simply repaints every time, which is the old behaviour
+      // rather than a hole.
+      for (uint8_t i = 0; i < FIELD_CACHE_ENTRIES; i++) {
+        FieldCache &entry = fieldCache[i];
+        if (entry.key != 0) continue;
+        entry.key = key;
+        entry.x = x; entry.y = y; entry.w = w; entry.h = h;
+        entry.color = color;
+        strcpy(entry.text, text);
+        break;
+      }
+      return true;
+    }
+
+    /*
+     * One fixed-width field, painted only when it would change the panel. The
+     * string handed in is already padded out to `chars` characters, so it covers
+     * the field by itself and the alignment is the caller's - the two below are
+     * the left- and right-aligned ways of building one.
+     *
+     * Two panels' worth of grid cells are what an unchanged field would cost to
+     * repaint, and the fields that change on their own - the current draw every
+     * second, the clock every minute - cannot be made to change any less often.
+     * So an unchanged field is skipped outright, and a changed one is written
+     * over in place: the padded string is the whole field, so there is no
+     * clear-then-draw and therefore no flash between the two.
+     */
+    void paintField(const char *field, int16_t x, int16_t y, uint8_t chars, uint16_t color) {
+      if (!fieldChanged(x, y, chars * CHAR_W, ROW_H, field, color)) return;
+
       tft.setTextColor(color, HMI_C_BG);
       tft.setTextSize(1);
       tft.setCursor(x, y);
       tft.print(field);
     }
 
-    // Right-aligned variant: the text ends at the right edge of its field.
-    void drawFieldRight(const char *text, int16_t y, uint8_t maxChars, uint16_t color) {
+    /*
+     * Text at the left edge of a field. Takes a plain C string rather than the
+     * F() macro other calls in this file use - a flash string would have to be
+     * copied into a RAM String to get here, and the brightness readout redraws
+     * these several times a second.
+     */
+    void drawField(const char *text, int16_t x, int16_t y, uint8_t chars, uint16_t color) {
       char field[LINE_BUFFER_SIZE];
-      clip(text, field, maxChars);
-      tft.fillRect(PANEL_WIDTH - maxChars * CHAR_W, y, maxChars * CHAR_W, ROW_H, HMI_C_BG);
-      tft.setTextColor(color, HMI_C_BG);
-      tft.setTextSize(1);
-      tft.setCursor(PANEL_WIDTH - strlen(field) * CHAR_W, y);
-      tft.print(field);
+      clipPadded(text, field, chars);
+      paintField(field, x, y, chars, color);
     }
 
+    /*
+     * The panel is written through directly, so anything that wipes it - a
+     * rotation change, a settings save that redraws the chrome - has to say so,
+     * or the fields painted after it would be skipped as already on screen.
+     */
+    void resetFieldCache() {
+      for (uint8_t i = 0; i < FIELD_CACHE_ENTRIES; i++) fieldCache[i].key = 0;
+      brightnessBarWidth = 0;   // the bar went with the panel
+      // The bottom bar is blank now, so whichever layout it held is gone and the
+      // next one can be drawn without wiping first.
+      bottomLayoutKnown = false;
+    }
+
+    /*
+     * Wipe a band of the panel and forget every field that was in it. The two
+     * belong together: a field the cache still believes is on screen would be
+     * skipped by the redraw that the wipe was for, and the band would keep a
+     * hole where that field used to be. The status bars do not need this - the
+     * fields on them cover the bar between them - but the main area has three
+     * different layouts to swap between and no way to cover all of them at once.
+     */
+    void clearBand(int16_t x, int16_t y, int16_t w, int16_t h) {
+      tft.fillRect(x, y, w, h, HMI_C_BG);
+      for (uint8_t i = 0; i < FIELD_CACHE_ENTRIES; i++) {
+        FieldCache &entry = fieldCache[i];
+        if (entry.key == 0) continue;
+        if (overlaps(x, y, w, h, entry.x, entry.y, entry.w, entry.h)) entry.key = 0;
+      }
+      // The brightness bar is not a field - it is a run of pixels whose end
+      // moves - but it went with the band like everything else on it.
+      if (y < Y_OVERLAY_BAR + ROW_H && Y_OVERLAY_BAR < y + h) brightnessBarWidth = 0;
+    }
+
+    /*
+     * Text ending at the panel's right edge. The field is the rightmost
+     * `maxChars` of the bar and the padding goes in front of the text, so the
+     * reading grows leftwards from the corner and the corner itself never moves
+     * - which is what makes a value that changes width, the current draw, sit
+     * still on a bar that redraws every second.
+     */
+    void drawFieldRight(const char *text, int16_t y, uint8_t maxChars, uint16_t color) {
+      char field[LINE_BUFFER_SIZE];
+      clipPaddedLeft(text, field, maxChars);
+      paintField(field, PANEL_WIDTH - maxChars * CHAR_W, y, maxChars, color);
+    }
+
+    /*
+     * Centred in the panel, and one line is the whole field - the panel's full
+     * width rather than the 156 px the 26 characters of the font grid cover,
+     * because a name that long starts two pixels in and so ends past where a
+     * shorter one does.
+     *
+     * Where the text starts depends on how long it is, so unlike the fields
+     * above this one cannot be padded out to a fixed width: a string that
+     * shrinks vacates cells on its left that only a wipe takes back, and the
+     * wipe has to come before the text rather than be replaced by it. It is
+     * still skipped outright while it reads the same, which is what keeps the
+     * ones that change on their own from flashing their whole line.
+     */
     void drawCentered(const char *text, int16_t y, uint16_t color) {
       char field[LINE_BUFFER_SIZE];
       clip(text, field, CHARS_PER_LINE);
-      uint8_t len = strlen(field);
+      if (!fieldChanged(0, y, PANEL_WIDTH, ROW_H, field, color)) return;
+
       tft.fillRect(0, y, PANEL_WIDTH, ROW_H, HMI_C_BG);
       tft.setTextColor(color, HMI_C_BG);
       tft.setTextSize(1);
-      tft.setCursor((PANEL_WIDTH - len * CHAR_W) / 2, y);
+      tft.setCursor((PANEL_WIDTH - (int16_t)strlen(field) * CHAR_W) / 2, y);
       tft.print(field);
     }
 
     void drawBigCentered(const char *text, int16_t y, uint16_t color) {
       char field[LINE_BUFFER_SIZE];
       clip(text, field, BIG_CHARS);
-      uint8_t len = strlen(field);
+      if (!fieldChanged(0, y, PANEL_WIDTH, 16, field, color)) return;
+
       tft.fillRect(0, y, PANEL_WIDTH, 16, HMI_C_BG);
       tft.setTextColor(color, HMI_C_BG);
       tft.setTextSize(2);
-      tft.setCursor((PANEL_WIDTH - len * BIG_CHAR_W) / 2, y);
+      tft.setCursor((PANEL_WIDTH - (int16_t)strlen(field) * BIG_CHAR_W) / 2, y);
       tft.print(field);
     }
 
@@ -440,9 +674,16 @@ class St7735DisplayUsermod : public Usermod {
 
     // ---- status bars ----------------------------------------------------------------
 
+    /*
+     * Neither bar is cleared before it is drawn. Every field on one is padded
+     * out to the width of the field and the two icons paint their own boxes, so
+     * between them they cover the bar; the few columns they leave unpainted are
+     * ones nothing else ever draws in. Clearing the bar first would put back the
+     * flash between the clear and the redraw, and the bottom bar is the one that
+     * cannot afford it - it redraws every second the current draw moves.
+     */
     void drawStatusTop() {
       char buf[LINE_BUFFER_SIZE];
-      tft.fillRect(0, Y_TOP, PANEL_WIDTH, STATUS_H, HMI_C_BG);
 
       // Clock. Always six characters wide so the date alongside it never moves.
       if (ntpEnabled) {
@@ -460,21 +701,27 @@ class St7735DisplayUsermod : public Usermod {
       }
       drawField(buf, X_TIME, Y_BAR1, TIME_CHARS, HMI_C_VALUE);
 
-      // Date, without the weekday - month and day alone fit beside the clock and
-      // leave the rest of the bar to the icons. Dropped when NTP is off, where
-      // it would be the epoch.
+      // Date. Zero-padded so it is the same ten columns on every day of the
+      // year, and dropped when NTP is off, where it would be the epoch.
       if (ntpEnabled) {
-        sprintf_P(buf, PSTR("%d/%d"), month(localTime), day(localTime));
+        sprintf_P(buf, PSTR("%04d-%02d-%02d"), year(localTime), month(localTime), day(localTime));
       } else {
         buf[0] = '\0';
       }
       drawField(buf, X_DATE, Y_BAR1, DATE_CHARS, HMI_C_LABEL);
 
-      // Brightness: the icon for a glance, the number for the exact value.
-      // Not padded to the field, unlike the overlay's copy of the same number:
-      // left-aligned, the digits keep their distance from the sun as they go
-      // from "8%" to "100%", and it is the sun they caption, not the bar edge.
-      drawBrightnessIcon(X_BRI_ICON, Y_TOP, knownBrightness);
+      // Brightness: the icon for a glance, the number for the exact value. The
+      // number is left-aligned in its field rather than against the signal icon
+      // the way the overlay's copy of it is, so the digits keep their distance
+      // from the sun as they go from "8%" to "100%": it is the sun they caption,
+      // not the edge of the bar.
+      //
+      // The sun is left at the level the strip would come back on at while the
+      // strip is off, so switching off empties the readout instead of flattening
+      // the icon: "0%" beside a ring is the one combination that reads as a
+      // fault rather than as off.
+      if (knownBrightness) lastNonZeroBri = knownBrightness;
+      drawBrightnessIcon(X_BRI_ICON, Y_TOP, lastNonZeroBri);
       sprintf_P(buf, PSTR("%d%%"), (int)knownBrightness * 100 / 255);
       drawField(buf, X_BRI_PCT, Y_BAR1, 4, HMI_C_VALUE);
 
@@ -483,7 +730,17 @@ class St7735DisplayUsermod : public Usermod {
 
     void drawStatusBottom() {
       char buf[LINE_BUFFER_SIZE];
-      tft.fillRect(0, Y_BOTTOM, PANEL_WIDTH, STATUS_H, HMI_C_BG);
+
+      // A switch between the bar's two layouts is the one thing here that needs
+      // the whole bar rather than the fields: they sit in different columns, so
+      // neither layout can paint over the other. It happens when the AP comes
+      // up or goes away, which is rare and deliberate, and the same session that
+      // shows the AP screen is the one where a wipe on it is expected.
+      if (bottomLayoutKnown && bottomIsAp != apActive) {
+        clearBand(0, Y_BOTTOM, PANEL_WIDTH, STATUS_H);
+      }
+      bottomLayoutKnown = true;
+      bottomIsAp = apActive;
 
       if (apActive) {
         // Joining the AP needs the address and the password, and while it is up
@@ -492,8 +749,8 @@ class St7735DisplayUsermod : public Usermod {
         drawField(WiFi.softAPIP().toString().c_str(), X_LINK, Y_BAR2, AP_IP_CHARS, HMI_C_WARN);
         char pass[LINE_BUFFER_SIZE];
         strcpy(pass, "Pass:");
-        strncat(pass, apPass, 12);
-        drawFieldRight(pass, Y_BAR2, 17, HMI_C_OK);
+        strncat(pass, apPass, AP_PASS_CHARS);   // clipPaddedLeft() cuts it to the field
+        drawFieldRight(pass, Y_BAR2, AP_PASS_CHARS, HMI_C_OK);
         return;
       }
 
@@ -505,8 +762,10 @@ class St7735DisplayUsermod : public Usermod {
         drawField("No link", X_LINK, Y_BAR2, LINK_CHARS, HMI_C_WARN);
       }
 
+      // Right-aligned in its field, so the corner the readout ends at is the
+      // same one every second while the number in front of it grows.
       sprintf_P(buf, PSTR("%u mA"), (unsigned)knownMilliamps);
-      drawFieldRight(buf, Y_BAR2, CURRENT_CHARS, HMI_C_WARN);
+      drawFieldRight(buf, Y_BAR2, MA_CHARS, HMI_C_WARN);
     }
 
     // ---- main area ------------------------------------------------------------------
@@ -518,14 +777,14 @@ class St7735DisplayUsermod : public Usermod {
       // Turning off (or on) changes what the whole area is about, so it repaints
       // everything; so does the very first paint after boot.
       if (fullMainRedraw || !mainDrawn || nowOff != mainOff) {
-        tft.fillRect(0, Y_MAIN, PANEL_WIDTH, Y_SEP2 - Y_MAIN, HMI_C_BG);
+        clearBand(0, Y_MAIN, PANEL_WIDTH, Y_SEP2 - Y_MAIN);
         mainDrawn = true;
         mainMode = 255; mainPalette = 255;
       }
       mainOff = nowOff;
 
       if (nowOff) {
-        drawBigCentered("OFF", Y_MAIN_BIG, HMI_C_OFF);
+        drawBigCentered("OFF", Y_POWER_BIG, HMI_C_OFF);
         return;
       }
 
@@ -560,8 +819,18 @@ class St7735DisplayUsermod : public Usermod {
       sprintf_P(buf, PSTR("%3d%%"), (int)bri * 100 / 255);
       drawField(buf, X_OVERLAY_PCT, Y_OVERLAY_TITLE, 4, HMI_C_VALUE);
 
-      tft.fillRect(0, Y_OVERLAY_BAR, PANEL_WIDTH, ROW_H, HMI_C_BAR_BG);
-      if (bri) tft.fillRect(0, Y_OVERLAY_BAR, (PANEL_WIDTH * (int)bri) / 255, ROW_H, levelColor());
+      // Only the 1 px or so between the old end and the new one is repainted.
+      // Refilling the whole trough on every repeat is what makes the bar the
+      // brightest thing on a flickering screen: a held button repaints it about
+      // seven times a second, and each of those wipes the full width back to
+      // the trough colour before drawing over it again.
+      int16_t width = (PANEL_WIDTH * (int)bri) / 255;
+      if (width < brightnessBarWidth) {
+        tft.fillRect(width, Y_OVERLAY_BAR, brightnessBarWidth - width, ROW_H, HMI_C_BAR_BG);
+      } else if (width > brightnessBarWidth) {
+        tft.fillRect(brightnessBarWidth, Y_OVERLAY_BAR, width - brightnessBarWidth, ROW_H, levelColor());
+      }
+      brightnessBarWidth = width;
     }
 
     void drawMainOverlay() {
@@ -573,12 +842,16 @@ class St7735DisplayUsermod : public Usermod {
         return;
       }
 
-      tft.fillRect(0, Y_MAIN, PANEL_WIDTH, Y_SEP2 - Y_MAIN, HMI_C_BG);
+      // An overlay that is not the one already up replaces its whole area, so the
+      // band goes rather than the handful of fields this view happens to use: the
+      // idle layout's, or another overlay's, are behind it and none of them can
+      // be reached from here to be cleared one at a time.
+      clearBand(0, Y_MAIN, PANEL_WIDTH, Y_SEP2 - Y_MAIN);
 
       switch (view.overlay()) {
         case HmiOverlay::POWER:
           drawField("Power", 0, Y_OVERLAY_TITLE, HALF_CHARS, HMI_C_LABEL);
-          drawBigCentered(bri ? "ON" : "OFF", Y_OVERLAY_BIG, bri ? HMI_C_OK : HMI_C_OFF);
+          drawBigCentered(bri ? "ON" : "OFF", Y_POWER_BIG, bri ? HMI_C_OK : HMI_C_OFF);
           break;
 
         case HmiOverlay::MODE: {
@@ -593,6 +866,12 @@ class St7735DisplayUsermod : public Usermod {
 
         case HmiOverlay::BRIGHTNESS:
           drawField("Brightness", 0, Y_OVERLAY_TITLE, HALF_CHARS, HMI_C_LABEL);
+          // The trough belongs to this view, not to the bar: on a repeat
+          // drawBrightnessOverlay() paints only the pixels between where the bar
+          // ended and where it ends now, which need something under them to be
+          // the difference from. clearBand() above has already said the bar went
+          // with the band, so the first of those repeats fills the trough in.
+          tft.fillRect(0, Y_OVERLAY_BAR, PANEL_WIDTH, ROW_H, HMI_C_BAR_BG);
           drawBrightnessOverlay();
           break;
 
@@ -652,6 +931,7 @@ class St7735DisplayUsermod : public Usermod {
       tft.setRotation(appliedRotation);
 
       tft.fillScreen(HMI_C_BG);
+      resetFieldCache();
       drawChrome();
 
       // The button state machine only understands press/release edges, so it is
@@ -710,7 +990,8 @@ class St7735DisplayUsermod : public Usermod {
       // Top bar: clock, date, signal, brightness.
       if (knownBrightness != bri) dirtyTop = true;
       if (ntpEnabled && (knownMinute != minute(localTime) || knownHour != hour(localTime) ||
-                         knownMonth != month(localTime) || knownDay != day(localTime))) dirtyTop = true;
+                         knownMonth != month(localTime) || knownDay != day(localTime) ||
+                         knownYear != year(localTime))) dirtyTop = true;
       if (knownQuality != quality) dirtyTop = true;
 
       // Bottom bar: address and current draw. This is the bar that repaints
@@ -744,6 +1025,7 @@ class St7735DisplayUsermod : public Usermod {
         knownHour   = hour(localTime);
         knownMonth  = month(localTime);
         knownDay    = day(localTime);
+        knownYear   = year(localTime);
       }
       knownIp = currentIp;
       knownApActive = apActive;
@@ -900,6 +1182,7 @@ class St7735DisplayUsermod : public Usermod {
           // The rules are part of the chrome, and setRotation() resets the
           // viewport, so they have to be redrawn with everything else.
           tft.fillScreen(HMI_C_BG);
+          resetFieldCache();
           drawChrome();
           fullMainRedraw = true;
           dirtyTop = dirtyBottom = dirtyMain = true;

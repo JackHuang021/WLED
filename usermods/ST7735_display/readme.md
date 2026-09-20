@@ -119,12 +119,12 @@ one-line status bars frame a 56 px main area:
 
 ```
    0 ┌──────────────────────────────────────────────────────────────┐
-     │ 14:32  9/19              ☀ 65%                  ▁▃▅█         │  time, date, brightness, signal
+     │ 14:32  2026-09-20        ☀ 65%                  ▁▃▅█         │  time, date, brightness, signal
   11 ├──────────────────────────────────────────────────────────────┤
   26 │                        Blink                                 │  effect name, size 2
   46 │                       Rainbow                                │  palette
   68 ├──────────────────────────────────────────────────────────────┤
-  71 │ 192.168.1.42                                1234 mA          │  address, current draw
+  71 │ 192.168.1.42                                      1234 mA │  address, current draw
   79 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -152,15 +152,69 @@ drawn from primitives rather than stored as bitmaps because the sun takes the li
 LED colour, the same one the brightness overlay's bar uses. The percentage 2 px
 away carries the value the icon can only approximate.
 
-Every field is a **fixed width**, and is cleared to that width before it is
-drawn — a value that shrinks (`192.168.1.42` → `No link`) would otherwise leave
-the tail of the longer one behind it. Long names are cut rather than wrapped
-(`textWrap` is off), because a wrapped line would print over the row below.
+**The sun describes the level, not the power state.** Switching the strip off
+drops `bri` to 0, but the icon stays at the level the strip would come back on
+at and only the number beside it falls to `0%`. A ring next to a `0%` is the one
+combination that reads as a fault — the icon looks broken rather than dimmed —
+and the level is the more useful of the two things to have on screen while the
+strip is dark.
+
+Every field is a **fixed width**, and is padded with spaces to that width before
+it is drawn — a value that shrinks (`192.168.1.42` → `No link`) would otherwise
+leave the tail of the longer one behind it. The fields that end at the right edge
+pad in front of the text instead, so it is the last character that is pinned to
+the corner. The padding is doing the clearing:
+the font is opaque, so writing the whole field covers exactly what a clear would
+have, without the flash that a clear-then-draw between two SPI transactions
+shows on a panel this small. A field whose padded string matches the one already
+on screen is skipped outright, which is what keeps the current draw — the one
+field that changes every second — from repainting itself over digits that did
+not move.
+
+For that reason a status bar is not **cleared** before it is drawn. Its fields
+are padded to their full width and the two icons paint their own boxes, so
+between them they cover most of the bar, and the columns they leave are ones
+nothing else ever draws in.
+
+The exception is the bottom bar's second layout. Its two layouts cannot share
+columns — the AP needs an address *and* a password, and `Pass:` plus even a short
+password is wider than the 54 px the current draw gives up — so switching
+between them wipes the bar rather than painting over it. That happens when the
+access point comes up or goes away: once per session, on a change the user made
+deliberately, which is why it can afford the clear that the every-second
+repaint cannot.
+
+Within either layout the fields stay clear of each other, and that is not a
+matter of taste: the font is opaque, so a field that reaches into another's
+columns paints its padding across them. A 15-character address under a
+right-aligned readout loses its tail that way — `192.168.1.42` comes out as
+`192.168.1.`. The address is given the 90 px the longest IPv4 address takes and
+the readout the 54 px the longest mA figure takes, 16 px apart, and two
+`static_assert`s in the source stop either of them growing back over the other.
+
+The centred lines cannot work that way. Where a centred string starts depends on
+how long it is, so it cannot be padded out to a fixed width: a string that
+shrinks vacates cells on its left that only a wipe takes back. Those lines are
+cleared and redrawn when their text changes and skipped outright when it does
+not, which is what keeps the ON/OFF line from flashing on the slow path between
+one state and the next.
+
+Anything that wipes the panel (`fillScreen`, a rotation change) resets that
+cache, and a wipe of part of it — the main area, which has three layouts to swap
+between — forgets the fields it covered. A full wipe also forgets which of the
+bottom bar's two layouts was on screen, which is only ever needed to decide
+whether swapping them has to wipe first.
+
+Long names are cut rather than wrapped (`textWrap` is off), because a wrapped
+line would print over the row below.
 
 Each region is repainted on its own, and only when something in it changed: the
 clock ticking does not disturb the effect name two rows below it. The current draw
 is the one field that changes every second; it is right-aligned so that the `mA`
-stays put while the number grows to its left.
+stays put while the number grows to its left. The brightness bar is repainted
+only over the pixels between its old end and its new one: a held button steps it
+about seven times a second, and refilling its whole width each time is the
+largest flicker the screen produces.
 
 **Degraded states**, all of which are handled:
 
