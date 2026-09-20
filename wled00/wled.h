@@ -335,7 +335,10 @@ WLED_GLOBAL bool rlyOpenDrain _INIT(RLYODRAIN);
   constexpr uint8_t hardwareTX = 1;
 #endif
 
-WLED_GLOBAL char ntpServerName[33] _INIT("0.wled.pool.ntp.org");   // NTP server to use
+// NTP server to use. This fork defaults to a mainland-China reachable server:
+// the global *.pool.ntp.org zone is silently dropped by many CN networks, which
+// leaves upstream's "0.wled.pool.ntp.org" default stuck at 1970 forever.
+WLED_GLOBAL char ntpServerName[33] _INIT("ntp.aliyun.com");
 
 // WiFi CONFIG (all these can be changed via web UI, no need to set them here)
 WLED_GLOBAL std::vector<WiFiConfig> multiWiFi;
@@ -523,11 +526,16 @@ WLED_GLOBAL char last_signal_src[13] _INIT("");     // last seen ESP-NOW sender
 #endif
 
 // Time CONFIG
+// NTP is on by default in this fork: the ESP32 has no RTC, so with NTP off the
+// clock reads 1970 after every reboot until the UI or API pushes a timestamp.
 #ifndef WLED_NTP_ENABLED
-  #define WLED_NTP_ENABLED false
+  #define WLED_NTP_ENABLED true
 #endif
+// Beijing time. The +8h is carried by the timezone rule itself (TZ_CHINA, both
+// DST entries are UTC+8), so UTC offset stays 0 - it is an extra *seconds*
+// correction applied to UTC before the timezone rule, not the hour offset.
 #ifndef WLED_TIMEZONE
-  #define WLED_TIMEZONE 0
+  #define WLED_TIMEZONE 9
 #endif
 #ifndef WLED_UTC_OFFSET
   #define WLED_UTC_OFFSET 0
