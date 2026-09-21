@@ -3,7 +3,7 @@
 // Two one-line status bars - clock, date, signal and brightness on top; address
 // and current draw below - frame a main area showing what the strip is doing.
 // The single BOOT button drives the three functions worth having without a
-// phone: on/off, brightness and effect. There is no menu - see docs/hmi.md for
+// phone: on/off, brightness and preset. There is no menu - see docs/hmi.md for
 // why, and readme.md for the gestures.
 //
 // TFT_eSPI is configured entirely from build flags (see readme.md), because the
@@ -279,6 +279,27 @@ static const PinManagerPinType displayPins[] = {
   { TFT_MOSI, true }
 };
 
+/*
+ * A preset is WLED's own unit of "a look worth going back to", and the double
+ * press walks those rather than the 200-odd entries of the mode list: the web UI
+ * is already where a preset gets built, named and reordered, so what the button
+ * steps through is a set the user has already chosen, and applying one brings
+ * its palette, colour and brightness along with the effect.
+ *
+ * Which ids exist is kept in a bitmap rather than asked of getPresetName(). That
+ * call reads the file every time and cannot tell "no such preset" from "the JSON
+ * buffer was busy" - it answers false to both - so it would have the button stop
+ * on gaps left by deleted presets. 250 bits is 32 bytes, and the bitmap is
+ * rebuilt from one read of presets.json when the file changes.
+ */
+#define HMI_PRESET_ID_MAX 250                      // 255 is WLED's temporary preset
+#define HMI_PRESET_BYTES  ((HMI_PRESET_ID_MAX + 8) / 8)
+// How many times a preset name is asked for before giving up on it. A failure
+// means either a busy JSON buffer or a preset saved without a name, and the two
+// are indistinguishable - so the retry is bounded, or an unnamed preset would
+// read the file once a second forever.
+#define HMI_PRESET_NAME_TRIES 3
+
 class St7735DisplayUsermod : public Usermod {
   private:
     static const char _name[];
@@ -297,6 +318,29 @@ class St7735DisplayUsermod : public Usermod {
 
     HmiGesture gesture;
     HmiView    view;
+
+    /*
+     * Which presets exist, and which one the button last walked to.
+     *
+     * The cursor is the usermod's own rather than WLED's `currentPreset`, for two
+     * reasons. handlePresets() does not apply a preset until after this usermod's
+     * loop() has already drawn for the pass (wled.cpp:149 against :104), so
+     * currentPreset is a pass behind the screen; and it is cleared to 0 by any
+     * state change at all, including the brightness this same button adjusts
+     * (led.cpp:93), which would send the next press back to the first preset.
+     * currentPreset is still read, but only as the hint that something outside
+     * this button applied one.
+     */
+    uint8_t  presetBits[HMI_PRESET_BYTES] = {};
+    uint16_t presetCount = 0;            // how many are set, i.e. the "N" on screen
+    uint16_t presetOrdinal = 0;          // position of the cursor, 1-based
+    uint8_t  presetCursor = 0;           // 0 = not in a preset
+    char     presetLabel[BIG_CHARS + 1] = {};  // its name, clipped to what fits the row
+    bool     presetLabelPending = false; // name not fetched yet
+    uint8_t  presetNameTries = 0;
+    bool     presetIndexValid = false;
+    unsigned long presetIndexStamp = 0xFFFFFFFF;  // presetsModifiedTime it was built at
+    uint8_t  presetCheckedId = 0;        // currentPreset already used to force a rebuild
 
     unsigned long lastUpdate = 0;
     unsigned long lastRedraw = 0;
@@ -856,10 +900,19 @@ class St7735DisplayUsermod : public Usermod {
 
         case HmiOverlay::MODE: {
           char name[BIG_CHARS + 1] = "";   // extractModeName may not write to it
-          drawField("Effect", 0, Y_OVERLAY_TITLE, HALF_CHARS, HMI_C_LABEL);
-          sprintf_P(buf, PSTR("%u/%u"), (unsigned)knownMode + 1, (unsigned)strip.getModeCount());
+          // In a preset the counter is a position in the set of presets, so the
+          // title says which set the number belongs to. Both titles are drawn into
+          // the same 13-character field, so one cannot leave letters behind the
+          // other.
+          bool inPreset = (presetCursor != 0 && presetCount != 0);
+          drawField(inPreset ? "Preset" : "Effect", 0, Y_OVERLAY_TITLE, HALF_CHARS, HMI_C_LABEL);
+          if (inPreset) sprintf_P(buf, PSTR("%u/%u"), (unsigned)presetOrdinal, (unsigned)presetCount);
+          else          sprintf_P(buf, PSTR("%u/%u"), (unsigned)knownMode + 1, (unsigned)strip.getModeCount());
           drawFieldRight(buf, Y_OVERLAY_TITLE, HALF_CHARS, HMI_C_LABEL);
-          extractModeName(knownMode, JSON_mode_names, name, BIG_CHARS);
+          // A preset with a name shows it; one saved without a name, or one whose
+          // name has not been read yet, shows the effect it put the strip in.
+          if (inPreset && presetLabel[0]) clip(presetLabel, name, BIG_CHARS);
+          else                            extractModeName(knownMode, JSON_mode_names, name, BIG_CHARS);
           drawBigCentered(name, Y_OVERLAY_BIG, HMI_C_ACCENT);
           break;
         }
@@ -887,6 +940,107 @@ class St7735DisplayUsermod : public Usermod {
       view.show(overlay, now);
       dirtyMain = true;
       hmiUrgent = true;
+    }
+
+    /*
+     * Rebuild the preset bitmap from /presets.json.
+     *
+     * Read straight off the filesystem rather than through WLED's JSON document:
+     * that buffer is a single shared instance, and holding it for the length of a
+     * parse would stall the web server, the playlist engine and handlePresets()
+     * alike. All that is wanted here is the set of keys of the outermost object,
+     * and those are the preset ids - everything inside a preset sits at a greater
+     * depth, so a brace counter tells a key from a string that merely looks like
+     * one.
+     */
+    void rebuildPresetIndex() {
+      memset(presetBits, 0, sizeof(presetBits));
+      presetCount = 0;
+      presetIndexStamp = presetsModifiedTime;
+
+      // Reading the filesystem while the strip is being written out is what
+      // shows up as a glitch in the LEDs, so WLED waits the frame out before
+      // every FS read it does (presets.cpp:171).
+      unsigned long maxWait = millis() + strip.getFrameTime();
+      while (strip.isUpdating() && millis() < maxWait) delay(1);
+
+      File f = WLED_FS.open(FPSTR(getPresetsFileName()), "r");
+      if (!f) {                    // no file at all means no presets, not a failure
+        presetIndexValid = true;
+        return;
+      }
+
+      uint8_t  depth = 0;          // 1 = the outermost object, where the ids live
+      bool     inString = false;
+      bool     escaped = false;
+      bool     collecting = false; // inside a string that started at depth 1
+      bool     numeric = true;     // ... and it has been digits throughout
+      uint16_t value = 0;
+      uint16_t pending = 0;        // a numeric key whose ':' has not been read yet
+
+      char buf[64];
+      while (f.available()) {
+        size_t got = f.read((uint8_t *)buf, sizeof(buf));
+        if (!got) break;
+        for (size_t i = 0; i < got; i++) {
+          char c = buf[i];
+          if (inString) {
+            if (escaped)                     { escaped = false; }
+            else if (c == '\\')              { escaped = true; }
+            else if (c == '"')               { inString = false; pending = (collecting && numeric) ? value : 0; collecting = false; }
+            else if (collecting && numeric)  {
+              if (c >= '0' && c <= '9') { value = value * 10 + (c - '0'); if (value > HMI_PRESET_ID_MAX) numeric = false; }
+              else numeric = false;
+            }
+            continue;
+          }
+          if (c == '"') { inString = true; collecting = (depth == 1); numeric = true; value = 0; continue; }
+          if (pending) {
+            // A key only is a key if a ':' follows it, whitespace aside. Anything
+            // else means that string was a value - an entry of the id array
+            // inside a playlist, say - and it is dropped.
+            if (c == ':') { markPreset(pending); pending = 0; continue; }
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+            pending = 0;
+          }
+          if (c == '{' || c == '[')       depth++;
+          else if (c == '}' || c == ']')  { if (depth) depth--; }
+        }
+      }
+      f.close();
+      presetIndexValid = true;
+      DEBUG_PRINTF_P(PSTR("ST7735 HMI: %u presets indexed.\n"), (unsigned)presetCount);
+    }
+
+    void markPreset(uint16_t id) {
+      if (id == 0 || id > HMI_PRESET_ID_MAX) return;
+      uint8_t &slot = presetBits[id >> 3];
+      uint8_t  bit  = 1 << (id & 7);
+      if (!(slot & bit)) { slot |= bit; presetCount++; }
+    }
+
+    // Position of `id` within the set, 1-based. 0 when it is not in the set.
+    uint16_t presetOrdinalOf(uint8_t id) const {
+      uint16_t n = 0;
+      for (uint16_t i = 1; i <= id; i++) if (presetBits[i >> 3] & (1 << (i & 7))) n++;
+      return n;
+    }
+
+    /*
+     * The next preset after `from`, wrapping past the end and over the gaps left
+     * by deleted presets, with the cursor's position moved onto it. 0 when there
+     * is nothing to go to, which is the signal to fall back to the mode list.
+     */
+    uint8_t stepPreset(uint8_t from) {
+      if (!presetCount) return 0;
+      for (uint16_t step = 1; step <= HMI_PRESET_ID_MAX; step++) {
+        uint8_t id = (uint8_t)(((from + step - 1) % HMI_PRESET_ID_MAX) + 1);
+        if (presetBits[id >> 3] & (1 << (id & 7))) {
+          presetOrdinal = presetOrdinalOf(id);
+          return id;
+        }
+      }
+      return 0;   // unreachable while presetCount is non-zero
     }
 
   public:
@@ -964,6 +1118,55 @@ class St7735DisplayUsermod : public Usermod {
       if (!hmiUrgent && !overlayExpired && (now - lastUpdate < USER_LOOP_REFRESH_RATE_MS)) return;
       lastUpdate = now;
       hmiUrgent = false;
+
+      /*
+       * Presets. Both halves of this are filesystem work, so they ride the poll
+       * above rather than running on every pass; the button only ever moves the
+       * cursor and leaves the reading to here.
+       */
+      if (!presetIndexValid || presetsModifiedTime != presetIndexStamp ||
+          (currentPreset && currentPreset != presetCheckedId &&
+           !(presetBits[currentPreset >> 3] & (1 << (currentPreset & 7))))) {
+        // The last clause is the fallback for a device with no clock: without NTP
+        // presetsModifiedTime can stay 0 right through a save, so a preset id the
+        // bitmap does not know is reason enough to look again. It is remembered
+        // per id, because the condition is not one a rebuild clears - an id this
+        // scan cannot see would otherwise re-read the file once a second forever.
+        presetCheckedId = currentPreset;
+        rebuildPresetIndex();
+        // The set can have changed under the cursor - a preset deleted ahead of it
+        // moves its position, and one deleted out from under it leaves nothing to
+        // be in - so the counter is recomputed rather than read as it stands.
+        if (presetCursor && !(presetBits[presetCursor >> 3] & (1 << (presetCursor & 7)))) presetCursor = 0;
+        presetOrdinal = presetCursor ? presetOrdinalOf(presetCursor) : 0;
+        dirtyMain = true;
+      }
+
+      // A preset applied from the web UI, a macro or a playlist moves the cursor
+      // too, or the next press would step from wherever the button last left it.
+      if (currentPreset && currentPreset != presetCursor) {
+        presetCursor = currentPreset;
+        presetOrdinal = presetOrdinalOf(currentPreset);
+        presetLabelPending = true;
+        presetNameTries = 0;
+      }
+
+      if (presetCursor && presetLabelPending) {
+        // getPresetName() answers false both for a busy JSON buffer and for a
+        // preset saved without a name, and the two cannot be told apart - so the
+        // retries are bounded, or an unnamed preset would read the file once a
+        // second for the rest of the session.
+        String name;
+        if (getPresetName(presetCursor, name)) {
+          clip(name.c_str(), presetLabel, BIG_CHARS);
+          presetLabelPending = false;
+          dirtyMain = true;
+        } else if (++presetNameTries >= HMI_PRESET_NAME_TRIES) {
+          presetLabel[0] = '\0';    // falls back to the effect name
+          presetLabelPending = false;
+          dirtyMain = true;
+        }
+      }
 
       // Blank the backlight after 5 minutes with nothing changing. A running clock
       // redraws once a minute, which would keep resetting this timer, so the auto-off
@@ -1070,12 +1273,34 @@ class St7735DisplayUsermod : public Usermod {
           showOverlay(HmiOverlay::POWER, now);
           break;
 
-        case HmiAction::MODE_NEXT:
-          effectCurrent = (effectCurrent + 1) % strip.getModeCount();
-          stateChanged = true;
-          colorUpdated(CALL_MODE_BUTTON);
+        case HmiAction::MODE_NEXT: {
+          // A preset carries the whole look - effect, palette, colour and however
+          // much brightness the user chose to save with it - so the double press
+          // walks the set built in the web UI rather than the 200-odd mode list.
+          //
+          // applyPreset() only records the request; handlePresets() acts on it
+          // later in the same pass (wled.cpp:149). The cursor is therefore moved
+          // here, and the screen reads that instead of currentPreset, which is
+          // both a pass behind and cleared by any state change at all.
+          uint8_t next = stepPreset(presetCursor);
+          if (next) {
+            applyPreset(next, CALL_MODE_BUTTON_PRESET);
+            presetCursor = next;
+            presetLabelPending = true;
+            presetNameTries = 0;
+          } else {
+            // Nothing saved yet, so the gesture keeps its old meaning rather than
+            // doing nothing until the user visits the web UI. The cursor goes with
+            // it: with no presets to be in, a leftover id would only make the
+            // first preset saved later look like the one already playing.
+            presetCursor = 0;
+            effectCurrent = (effectCurrent + 1) % strip.getModeCount();
+            stateChanged = true;
+            colorUpdated(CALL_MODE_BUTTON);
+          }
           showOverlay(HmiOverlay::MODE, now);
           break;
+        }
 
         case HmiAction::BRI_STEP: {
           // Fine steps at first, so the bottom of the range can be set precisely,
@@ -1157,9 +1382,9 @@ class St7735DisplayUsermod : public Usermod {
       oappend(SET_F("addOption(dd,'3 (default)',3);"));
       oappend(SET_F("addOption(dd,'1 (rotated 180)',1);"));
 
-      oappend(F("addInfo('")); oappend(String(FPSTR(_name)).c_str()); oappend(F(":hmi',1,'','button 0 drives the screen: short=on/off, double=next effect, long=brightness. On by default; while it is on, the three button 0 macros on the Time settings page do nothing.');"));
+      oappend(F("addInfo('")); oappend(String(FPSTR(_name)).c_str()); oappend(F(":hmi',1,'','button 0 drives the screen: short=on/off, double=next preset, long=brightness. The presets are the ones on the Presets page, walked in id order with deleted ids skipped; with none saved, the double press falls back to the next effect. On by default; while it is on, the three button 0 macros on the Time settings page do nothing.');"));
       oappend(F("addInfo('")); oappend(String(FPSTR(_name)).c_str()); oappend(F(":hmiDouble',1,'','double-press window in ms, matching WLED. Shortening it makes the on/off press snappier; setting it to 0 removes the delay entirely and gives up the double press.');"));
-      oappend(F("addInfo('")); oappend(String(FPSTR(_name)).c_str()); oappend(F(":hmiOverlay',1,'','how long the brightness/effect readout stays on screen after the last press, in ms.');"));
+      oappend(F("addInfo('")); oappend(String(FPSTR(_name)).c_str()); oappend(F(":hmiOverlay',1,'','how long the brightness/preset readout stays on screen after the last press, in ms.');"));
       oappend(F("addInfo('")); oappend(String(FPSTR(_name)).c_str()); oappend(F(":hmiRepeat',1,'','how often the brightness steps while the button is held, in ms. The first few steps are slower (200 ms) so the low end can be set precisely.');"));
       oappend(F("addInfo('")); oappend(String(FPSTR(_name)).c_str()); oappend(F(":hmiStep',1,'','brightness step once the button has been held for a moment. The first steps are finer (4) so the low end can be set precisely.');"));
     }

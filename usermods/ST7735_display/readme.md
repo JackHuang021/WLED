@@ -2,7 +2,7 @@
 
 Drives a 0.96" ST7735 SPI TFT (160x80, landscape) from WLED, and puts the board's
 single BOOT button to work as a control for the three things worth having without
-a phone: on/off, brightness and effect.
+a phone: on/off, brightness and preset.
 
 The screen is two **persistent status bars** with a **main area** between them:
 
@@ -238,10 +238,35 @@ it over. Its gestures mirror WLED's own so the timing feels the same:
 | gesture | action | when it fires |
 |---|---|---|
 | short press | on / off | 350 ms after release — the double-press window has to close first |
-| double press | next effect | on the second release |
+| double press | next preset | on the second release |
 | long press | brightness, stepping every 150 ms while held | 600 ms after pressing down |
 | hold 5–10 s | start the access point | on release |
 | hold 10 s + | factory reset | on release |
+
+### The double press walks presets
+
+Not effects, and the reason is arithmetic: there are around 220 effects compiled
+in, so stepping one at a time is useless for reaching the one you want. Presets
+are the set you already curated and named on the **Presets** page, so the same
+gesture gets you between the handful of looks you actually use.
+
+* It walks **existing** presets in id order and **skips the gaps** left by deleted
+  ones, wrapping from the last back to the first.
+* Applying a preset applies **whatever was saved in it** — palette, colour and
+  brightness included, not just the effect. That is what a preset is; if you want
+  the button to change nothing but the effect, save the preset without the
+  brightness ticked.
+* With **no presets saved at all**, the double press falls back to the next
+  effect, so the gesture is never dead. The title reads `Effect` instead of
+  `Preset` when this is what is happening.
+* A preset saved without a name shows the effect it switches the strip to.
+  Naming them on the Presets page is worth the ten seconds.
+* There is still **no "previous preset"** — one button has no gesture left for it.
+  See `docs/hmi.md` §3.4 for why presets are the answer here and what the
+  alternatives cost.
+
+Presets are read, never written: switching from the button does not modify or
+re-save anything.
 
 **Brightness direction alternates**: each long press flips it, so the first one
 brightens and the next dims. Since the sign cannot be known before pressing, the
@@ -252,7 +277,7 @@ direction is shown **the moment the long press starts** — that is what the `+`
 ### Operation views
 
 Pressing a button replaces the main area with a view of what is being changed —
-the effect name for a double press, `ON`/`OFF` for a short press, a full-width bar
+the preset name and its position for a double press, `ON`/`OFF` for a short press, a full-width bar
 and percentage while the brightness is adjusted. It is **not a screen you have to
 leave**: it disappears on its own 1.5 s after the last press. Nothing needs
 confirming, because every change takes effect immediately.
@@ -289,7 +314,10 @@ While the display usermod owns button 0:
 * No `button/0` message is published to MQTT, because that publish lives inside
   the handlers that no longer run. State changes still notify normally, since
   everything here goes through `stateUpdated(CALL_MODE_BUTTON)`.
-* Effects only cycle forwards — one button has no gesture left for "previous".
+* Presets only cycle forwards — one button has no gesture left for "previous".
+* Once even one preset is saved, the raw effect list is no longer reachable from
+  the button at all; the double press walks presets instead. Use the web UI, or
+  save the effect you want as a preset.
 
 Set `hmi` to `false` on the usermod settings page to hand the button back to WLED
 completely; the display keeps working.
@@ -423,14 +451,19 @@ wrong — check that `ST7735_DRIVER` is set.
   — and a branch to pick between them, which nothing currently does.
 * **No menu.** Effect palette, speed and intensity are not reachable from the
   button; they need the web UI. The three gestures are spent on on/off, brightness
-  and effect selection, and they are not on screen either — see below.
+  and preset selection, and they are not on screen either — see below.
   [docs/hmi.md](../../docs/hmi.md) works through what a menu would cost and how it
   would be added if these turn out to be needed.
+* **A preset cannot be created from the button** — only chosen. Saving one means
+  the web UI. This is the one gap the preset scheme leaves open; see
+  [docs/hmi.md §9](../../docs/hmi.md#9-后续演进).
 * **The SSID is no longer on screen.** The bottom bar has room for the address, not
   the network name; it is on the settings page instead.
 * **Brightness, effect and on/off are volatile**, as they are everywhere else in
   WLED: they survive until the next reboot unless a preset is saved. The button
-  cannot save one.
+  cannot save one. A brightness you set with a long press is therefore lost the
+  moment you double-press on to the next preset, which brings its own brightness
+  back with it.
 * **The screen cannot be switched off.** With `TFT_BL` at -1 there is no backlight
   pin to turn down, and a colour TFT's backlight is a continuous drain. The
   automatic blanking described under [Backlight](#backlight) is a no-op on such a
@@ -443,5 +476,7 @@ wrong — check that `ST7735_DRIVER` is set.
 * **The AP password displaces the current draw**, not the address: while the
   access point is up the bottom bar becomes its address and password, because
   joining it is the only thing anyone is doing at that moment.
-* **Speed, intensity, preset and frame rate are not on screen.** They are in the
-  web UI. The main area has the room for them if they turn out to be missed.
+* **Speed, intensity and frame rate are not on screen.** They are in the web UI.
+  The main area has the room for them if they turn out to be missed. The preset
+  *name* does appear, but only while the double-press view is up; the idle main
+  area still shows the effect and its palette.
