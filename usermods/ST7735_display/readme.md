@@ -265,14 +265,62 @@ gesture gets you between the handful of looks you actually use.
   See `docs/hmi.md` §3.4 for why presets are the answer here and what the
   alternatives cost.
 
-Presets are read, never written: switching from the button does not modify or
-re-save anything.
+Choosing a preset does not modify it — but a long press afterwards does; see
+[below](#the-brightness-is-saved-back-into-the-preset).
 
 **Brightness direction alternates**: each long press flips it, so the first one
 brightens and the next dims. Since the sign cannot be known before pressing, the
 direction is shown **the moment the long press starts** — that is what the `+` /
 `-` next to the percentage in the main area is for. The first few steps are finer
 (4) than the rest (`hmiStep`, 16) so the bottom of the range can be set precisely.
+
+### The brightness is saved back into the preset
+
+WLED keeps its state — brightness, effect, colours, on/off — in RAM, and a preset
+is the only thing that writes it to flash. So a preset is a snapshot, and until
+now a brightness dialled in on the button was in no snapshot at all: switching
+away and back brought the preset's own level back, and a reboot brought the
+startup brightness.
+
+What the button does about that is **the narrowest thing that makes the level
+stick**: a long press on brightness writes the new level back into the preset the
+strip is *in*, at the moment it is in it.
+
+* Only the **long press** does it. A short press (on/off) and a double press are
+  not saved — you turn the strip off to go to bed far more often than you mean to
+  re-level a preset, and a preset that has gone dark because of one is hard to
+  diagnose. A short press or a double press *before the brightness view has dropped*
+  cancels the write the long press had queued, so pressing the button again is how
+  you take it back.
+* It writes into the preset the screen is showing, the `N` of `Preset N/M`, so that
+  is the one a long press re-levels. There has to **be** one: at boot, and until the
+  double press has walked into a preset, the button has nothing to save to and
+  quietly does nothing.
+* `hmiOverlayMs` is therefore also how long the level waits before it is written —
+  it is the dwell of the brightness view. Shortening it makes the save happen
+  sooner, at the cost of the readout disappearing sooner.
+* A preset whose slot holds a **playlist** is left alone. Writing a state into it
+  would replace the playlist with whatever the strip is doing right now.
+* The write lands **when the brightness view drops and the main screen comes
+  back** — not on release, and not after a delay you have to count. That moment is
+  already on screen, so you can watch the screen go back to normal and know the
+  level is stored. It also collapses a run of presses for free: each one puts the
+  view back up, which holds the write off, so dimming, letting go, and dimming
+  again lands as one write at the end rather than one per press.
+* What goes in is the **whole current state**, not the brightness on its own —
+  WLED has no way to patch one key of a preset. In practice that is the same
+  thing, because nothing else has changed since the preset was applied. If
+  something has, it goes in too, and the preset becomes a snapshot of now.
+* The preset keeps its **name**. A save that cannot read the name back off the
+  file is skipped rather than allowed to rename it.
+
+To survive a **reboot**, set *Apply preset N at boot* under
+[LED preferences](../../wled00/data/settings_leds.htm) to the preset you keep the
+level in. Without a boot preset the strip still comes up at the startup brightness
+— presets are the only persistence there is, and nothing here adds a second one.
+
+Set `hmiSave` to `false` on the usermod settings page to turn the whole thing off,
+in which case the button goes back to being unable to lose you anything.
 
 ### Operation views
 
@@ -299,8 +347,10 @@ configuration, alongside holding GPIO9 down while the board resets.
 
 One consequence to be aware of: a hold that reaches the 5 s AP threshold has also
 been adjusting brightness for the previous 4.4 s, so the strip will be at full
-brightness when the AP comes up. Brightness is not persisted, so a reboot (or the
-preset that gets applied afterwards) restores it.
+brightness when the AP comes up. That ramp is an artefact of the gesture rather
+than a level anyone chose, and the same hold is how you get back from it — so it
+cancels the write-back it would otherwise have queued. What you come back to is
+the saved level, not full brightness.
 
 ### What is given up
 
@@ -454,16 +504,18 @@ wrong — check that `ST7735_DRIVER` is set.
   and preset selection, and they are not on screen either — see below.
   [docs/hmi.md](../../docs/hmi.md) works through what a menu would cost and how it
   would be added if these turn out to be needed.
-* **A preset cannot be created from the button** — only chosen. Saving one means
-  the web UI. This is the one gap the preset scheme leaves open; see
+* **A preset cannot be created from the button**, only chosen and then re-levelled
+  by a long press; a new one still means the web UI. See
   [docs/hmi.md §9](../../docs/hmi.md#9-后续演进).
 * **The SSID is no longer on screen.** The bottom bar has room for the address, not
   the network name; it is on the settings page instead.
 * **Brightness, effect and on/off are volatile**, as they are everywhere else in
-  WLED: they survive until the next reboot unless a preset is saved. The button
-  cannot save one. A brightness you set with a long press is therefore lost the
-  moment you double-press on to the next preset, which brings its own brightness
-  back with it.
+  WLED: they live in RAM until a preset is saved. A long press is the exception —
+  it writes the new level back into the preset the strip is in, so switching away
+  and back brings the new level with it
+  ([details](#the-brightness-is-saved-back-into-the-preset)). It does not survive a
+  reboot on its own: the strip boots at the startup brightness unless *Apply preset
+  N at boot* points at the preset holding the level.
 * **The screen cannot be switched off.** With `TFT_BL` at -1 there is no backlight
   pin to turn down, and a colour TFT's backlight is a continuous drain. The
   automatic blanking described under [Backlight](#backlight) is a no-op on such a
