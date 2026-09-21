@@ -1311,6 +1311,22 @@ class St7735DisplayUsermod : public Usermod {
         fireStateSave();
       }
 
+      /*
+       * The brightness view is the adjustment, so the direction belongs to it:
+       * while the percentage is on screen a long press reverses the one before it
+       * and dims, and once it is gone the next long press brightens again. Left to
+       * itself the direction is a memory that outlives the gesture, and the press
+       * after a finished adjustment dims the strip - the opposite of the thing the
+       * user just did and now wants more of.
+       *
+       * This is the same door as the write-back above: anything that takes the
+       * view off the screen ends the adjustment, including another readout
+       * (power, preset) replacing it. It reads the view rather than counting
+       * presses, so a hold that is still going - repeats call showOverlay() and
+       * keep the view up - cannot reset itself mid-ramp.
+       */
+      if (view.overlay() != HmiOverlay::BRIGHTNESS) gesture.resetDirection();
+
       IPAddress currentIp = apActive ? WiFi.softAPIP() : WLEDNetwork.localIP();
       int16_t quality = WLED_CONNECTED ? getSignalQuality(WiFi.RSSI()) : -1;
 
@@ -1536,7 +1552,7 @@ class St7735DisplayUsermod : public Usermod {
       oappend(F("addInfo('")); oappend(String(FPSTR(_name)).c_str()); oappend(F(":hmi',1,'','button 0 drives the screen: short=on/off, double=next preset, long=brightness. The presets are the ones on the Presets page, walked in id order with deleted ids skipped; with none saved, the double press falls back to the next effect. On by default; while it is on, the three button 0 macros on the Time settings page do nothing.');"));
       oappend(F("addInfo('")); oappend(String(FPSTR(_name)).c_str()); oappend(F(":hmiSave',1,'','a long press on brightness writes the new level back into the preset shown on screen, so walking back to that preset - or booting into it - brings the level with it. The write happens when the brightness view drops and the main screen comes back, so it is the end of the adjustment rather than a fixed delay. Only the brightness gesture does this: short press and double press are not saved. Nothing is written while the strip is not in a preset, and a preset that holds a playlist is left alone. What goes in is the whole current state rather than the brightness on its own, so anything else changed since that preset was applied goes in with it. This is not by itself what makes a level survive a reboot: set \"Apply preset N at boot\" in LED preferences too, or the strip still comes up at the startup brightness.');"));
       oappend(F("addInfo('")); oappend(String(FPSTR(_name)).c_str()); oappend(F(":hmiDouble',1,'','double-press window in ms, matching WLED. Shortening it makes the on/off press snappier; setting it to 0 removes the delay entirely and gives up the double press.');"));
-      oappend(F("addInfo('")); oappend(String(FPSTR(_name)).c_str()); oappend(F(":hmiOverlay',1,'','how long the brightness/preset readout stays on screen after the last press, in ms.');"));
+      oappend(F("addInfo('")); oappend(String(FPSTR(_name)).c_str()); oappend(F(":hmiOverlay',1,'','how long the brightness/preset readout stays on screen after the last press, in ms. The brightness readout is also the adjustment it belongs to: while it is up, another long press reverses the direction and dims, and once it has dropped the next long press brightens again.');"));
       oappend(F("addInfo('")); oappend(String(FPSTR(_name)).c_str()); oappend(F(":hmiRepeat',1,'','how often the brightness steps while the button is held, in ms. The first few steps are slower (200 ms) so the low end can be set precisely.');"));
       oappend(F("addInfo('")); oappend(String(FPSTR(_name)).c_str()); oappend(F(":hmiStep',1,'','brightness step once the button has been held for a moment. The first steps are finer (4) so the low end can be set precisely.');"));
     }

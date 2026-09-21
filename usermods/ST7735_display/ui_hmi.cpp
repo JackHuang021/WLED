@@ -33,7 +33,10 @@ HmiAction HmiGesture::update(bool pressed, uint32_t now)
       if (now - _pressedTime < HMI_LONG_PRESS_MS) return HmiAction::NONE;
       // Long press. It cancels any pending short/double press, and flips the
       // brightness direction - there is only one button, so the direction is a
-      // memory the user builds up rather than something they can see first.
+      // memory the user builds up rather than something they can see first. It
+      // only lasts as long as the adjustment: the caller resets it when the
+      // brightness view drops, so this flip is "reverse what I am doing now"
+      // while the readout is up and "brighten" for the first press after it.
       _longFired = true;
       _waitTime = 0;
       _dir = (_dir > 0) ? -1 : 1;

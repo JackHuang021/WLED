@@ -46,7 +46,8 @@ class HmiGesture {
     HmiAction update(bool pressed, uint32_t now);
 
     // +1 while the current long press brightens, -1 while it dims. Read it
-    // together with the BRI_STEP it belongs to - it changes with each press.
+    // together with the BRI_STEP it belongs to - it flips on the long press that
+    // starts each adjustment, and resetDirection() is what ends one.
     int8_t direction() const { return _dir; }
 
     // Repeats the current long press has already produced. 0 for the first step.
@@ -57,6 +58,15 @@ class HmiGesture {
     void setDoublePressMs(uint16_t ms) { _doubleMs = ms; }
     void setRepeatMs(uint16_t ms)      { _repeatFastMs = ms ? ms : HMI_REPEAT_FAST_MS; }
 
+    /*
+     * End the adjustment, so the next long press brightens instead of carrying
+     * the last one's direction into it. The direction is a property of one
+     * adjustment rather than a mode the button sits in, and the brightness view
+     * is what an adjustment is - so the caller resets this when that view leaves
+     * the screen. This class has no view to watch, deliberately.
+     */
+    void resetDirection() { _dir = -1; }
+
   private:
     bool     _pressedBefore = false;
     bool     _longFired = false;
@@ -64,7 +74,8 @@ class HmiGesture {
     uint32_t _waitTime = 0;      // a short press waiting out the double-press window; 0 = none
     uint32_t _repeatAt = 0;      // when the last repeat fired
     // Starts at -1 so that the first long press flips it to +1 and brightens,
-    // which is what WLED's own button 1 does (button.cpp:309).
+    // which is what WLED's own button 1 does (button.cpp:309). resetDirection()
+    // puts it back here, which is what makes every adjustment start brighter.
     int8_t   _dir = -1;
     uint8_t  _repeats = 0;
     uint16_t _doubleMs = 350;    // WLED_DOUBLE_PRESS; 0 disables double press

@@ -268,11 +268,16 @@ gesture gets you between the handful of looks you actually use.
 Choosing a preset does not modify it — but a long press afterwards does; see
 [below](#the-brightness-is-saved-back-into-the-preset).
 
-**Brightness direction alternates**: each long press flips it, so the first one
-brightens and the next dims. Since the sign cannot be known before pressing, the
-direction is shown **the moment the long press starts** — that is what the `+` /
-`-` next to the percentage in the main area is for. The first few steps are finer
-(4) than the rest (`hmiStep`, 16) so the bottom of the range can be set precisely.
+**Brightness starts brighter, and the readout is what reverses it**: the first long
+press of an adjustment brightens, and while the percentage is still on screen
+pressing again reverses it and dims. Once the readout has dropped, the next long
+press means "brighter" again — the direction is a property of one adjustment, not
+a mode the button sits in, so it never carries over from the previous one. The
+window for the reversal is `hmiOverlayMs` (1.5 s by default), the same clock as
+the readout itself. Since the sign cannot be known before pressing, it is shown
+**the moment the long press starts** — that is what the `+` / `-` next to the
+percentage in the main area is for. The first few steps are finer (4) than the
+rest (`hmiStep`, 16) so the bottom of the range can be set precisely.
 
 ### The brightness is saved back into the preset
 
@@ -305,8 +310,8 @@ strip is *in*, at the moment it is in it.
   back** — not on release, and not after a delay you have to count. That moment is
   already on screen, so you can watch the screen go back to normal and know the
   level is stored. It also collapses a run of presses for free: each one puts the
-  view back up, which holds the write off, so dimming, letting go, and dimming
-  again lands as one write at the end rather than one per press.
+  view back up, which holds the write off, so a run of steps lands as one write
+  at the end rather than one per press.
 * What goes in is the **whole current state**, not the brightness on its own —
   WLED has no way to patch one key of a preset. In practice that is the same
   thing, because nothing else has changed since the preset was applied. If
