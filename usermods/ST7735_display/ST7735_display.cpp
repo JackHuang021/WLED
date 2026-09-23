@@ -238,17 +238,23 @@ TFT_eSPI tft = TFT_eSPI(TFT_WIDTH, TFT_HEIGHT); // Invoke custom library
  * much closer to what TFT_eSPI had (0xC0 = 62 02 04 against TFT_eSPI's A2 02 84 and
  * the loose file's 0E 0E 04); the loose file's values blanked the panel outright.
  *
- * Ordering: reset, sleep out, configure, and only then display on. TFT_eSPI already
- * did the reset (0x01/0x11 with their delays), so the register writes are re-issued
- * here in the vendor's order, including its 0x20 and its trailing 0x29. 0x36 is left
- * out because setRotation() writes it a few lines later - and it has to, since the
- * vendor's portrait value 0x08 does not apply to the landscape rotations this usermod
- * uses; 0x2A/0x2B are the tab variant's, and 0x3A is TFT_eSPI's own (same value).
+ * Ordering: reset, sleep out, configure - and then display on, except that last step is
+ * not here. The vendor's sequence ends with 0x29 and this one deliberately does not:
+ * nothing has been drawn at this point, so turning the panel on would only show it the
+ * GRAM it powered up with. setup() sends the 0x29 itself, once the first frame is
+ * complete. TFT_eSPI's own init table carries the same command and is neutralised the
+ * same way - see pio-scripts/tft_espi_c3_fixes.py.
+ *
+ * TFT_eSPI already did the reset (0x01/0x11 with their delays), so the register writes
+ * are re-issued here in the vendor's order, including its 0x20. 0x36 is left out
+ * because setRotation() writes it a few lines later - and it has to, since the vendor's
+ * portrait value 0x08 does not apply to the landscape rotations this usermod uses;
+ * 0x2A/0x2B are the tab variant's, and 0x3A is TFT_eSPI's own (same value).
  *
  * Format: TFT_eSPI's commandList() - count, then (command, argument count, args).
  */
 static const uint8_t PROGMEM PANEL_INIT[] = {
-  15,                                             // commands in the list
+  14,                                             // commands in the list
   0x20, 0,                                        // inversion off - this panel never inverts
   0xB1, 3, 0x05, 0x3A, 0x3A,                      // frame rate: normal mode
   0xB2, 3, 0x05, 0x3A, 0x3A,                      //             idle mode
@@ -264,8 +270,7 @@ static const uint8_t PROGMEM PANEL_INIT[] = {
             0x0A, 0x12, 0x27, 0x37, 0x00, 0x0D, 0x0E, 0x10,  // gamma, positive
   0xE1, 16, 0x10, 0x0E, 0x03, 0x03, 0x0F, 0x06, 0x02, 0x08,
             0x0A, 0x13, 0x26, 0x36, 0x00, 0x0D, 0x0E, 0x10,  // gamma, negative
-  0x3A, 1, 0x05,                                  // 16-bit colour, unchanged
-  0x29, 0                                         // display on
+  0x3A, 1, 0x05                                   // 16-bit colour, unchanged
 };
 
 // Pins claimed through PinManager. -1 entries are treated as "not present" and
@@ -1175,6 +1180,20 @@ class St7735DisplayUsermod : public Usermod {
         SPI.end();
       }
 
+      // init() leaves the panel dark, and that is load-bearing. TFT_eSPI's own init table
+      // ends by turning the display on, and the panel has just come out of the reset that
+      // init opens with - so its GRAM is still power-on noise, and a stock build flashes
+      // that noise on screen for the ~8 ms the fillScreen() below needs to cover it. The
+      // DISPON is turned into a NOP by pio-scripts/tft_espi_c3_fixes.py so that init does
+      // not show it at all.
+      //
+      // Undoing it from here instead does not work, which is what the comment in that
+      // script is about: on this panel DISPOFF (0x28) does not blank the picture, it only
+      // stops it being refreshed, so a DISPOFF after init leaves the noise up for exactly
+      // as long as it would have been without one.
+      //
+      // Everything below writes registers and GRAM while the panel sits blank; the 0x29
+      // at the bottom of setup() is the first thing it ever shows.
       tft.init();
 
       // Tune the panel to the values its vendor ships, before setRotation() writes
@@ -1190,6 +1209,10 @@ class St7735DisplayUsermod : public Usermod {
       tft.fillScreen(HMI_C_BG);
       resetFieldCache();
       drawChrome();
+
+      // The frame drawn above is the first thing this panel ever shows - it has been dark
+      // since the reset init() opened with.
+      tft.writecommand(0x29);   // DISPON
 
       // The button state machine only understands press/release edges, so it is only
       // offered a momentary button. Anything else keeps WLED's own handling.

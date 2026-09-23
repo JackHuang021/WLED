@@ -21,24 +21,40 @@
 #    belongs at -1.  The condition also names the S2, but S2 builds use TFT_eSPI_ESP32.h
 #    (see the dispatch in TFT_eSPI.h), so the block is dead here and is dropped outright.
 #
-# 3. Startup timing, trimmed out of the ST7735 init table.  The firmware works without this
-#    -- it is the largest single piece of the ~5 s this board takes to put a first frame on
-#    the panel.  tft.init() walks the legacy ST7735R table, whose waits total ~0.9 s: 150 ms
+# 3. The ST7735 init table turns the panel on before there is anything to show it.  Not a
+#    defect either, but it is visible.  init's Rcmd3 ends by sending DISPON, and the panel
+#    has just come out of the reset init opened with, so its GRAM still holds whatever the
+#    controller powered up with.  The panel therefore lights up showing noise, and goes on
+#    showing it for the ~8 ms `fillScreen()` needs to cover the screen - a flash of static
+#    between the boot and the UI.  The command is rewritten to a NOP so init leaves the
+#    panel dark; the usermod sends its own DISPON once the first frame is in GRAM (see
+#    setup() in usermods/ST7735_display/ST7735_display.cpp).
+#    This cannot be papered over from the usermod side: on this panel DISPOFF does not
+#    blank the picture, it only stops it being refreshed, so a DISPON from init followed by
+#    a DISPOFF from usermod setup() leaves the noise on screen for exactly as long.  The
+#    command has to not be sent in the first place.
+#
+# 4. Startup timing, trimmed out of the same table.  The firmware works without this -- it
+#    is the largest single piece of the ~5 s this board takes to put a first frame on the
+#    panel.  tft.init() walks the legacy ST7735R table, whose waits total ~0.9 s: 150 ms
 #    after the hardware reset (TFT_eSPI.cpp), then in Rcmd1 150 ms after SWRESET and 500 ms
 #    after SLPOUT, then 100 ms after DISPON in Rcmd3.  Every one of those registers is
 #    re-issued by the usermod's own PANEL_INIT immediately afterwards, in the vendor's
 #    order, so the panel is configured for real only once the waits are already over.
-#    The three numbers below are cut to 120/120/20 ms -- still well clear of what an
-#    ST7735S asks for after a reset or a sleep-out, which is 120 ms, and the display-on
-#    wait is slack the controller does not use.  If a panel ever comes up blank on a cold
-#    boot, these are the first numbers to put back; they are the only ones here that trade
-#    margin for speed.
+#    The numbers below are cut to 120/120/20 ms -- still well clear of what an ST7735S asks
+#    for after a reset or a sleep-out, which is 120 ms, and the display-on wait is slack
+#    the controller never used (it now follows the NOP from patch 3, which is why that NOP
+#    keeps its delay byte rather than the entry being deleted outright).  If a panel ever
+#    comes up blank on a cold boot, these are the first numbers to put back; they are the
+#    only ones here that trade margin for speed.
 #
-# Fatality is per patch: a patch is fatal when the firmware's behaviour depends on it.  The
-# two C3 defects are fatal because the board watchdog-resets without them.  The timing trims
-# are not -- if a future TFT_eSPI reshapes the table the build should still produce working
-# firmware, just a slower one, so those warn and carry on.  A stale fatal patch stops the
-# build rather than shipping a firmware that resets forever.
+# Fatality: a patch is fatal when the firmware's behaviour depends on it.  The two C3
+# defects are fatal because the board watchdog-resets without them, and the DISPON rewrite
+# is fatal because the usermod's setup() is written on the assumption that init() left the
+# panel dark.  The timing trims are not fatal -- if a future TFT_eSPI reshapes the table
+# the build should still produce working firmware, just a slower one, so those warn and
+# carry on.  A stale fatal patch stops the build rather than shipping a firmware that
+# resets forever or lights up with noise.
 #
 # Every patch is idempotent and reports what it did.  Delete this script (and its
 # extra_scripts entry) once the pinned TFT_eSPI release contains the upstream fixes --
@@ -86,6 +102,16 @@ TARGETS = [
   (
     ST7735_INIT_TABLE,
     [
+      (
+        "DISPON turned into a NOP, so init() leaves the panel dark",
+        "    ST7735_DISPON ,    TFT_INIT_DELAY, //  4: Main screen turn on, no args w/delay\n",
+        "    0x00, TFT_INIT_DELAY,           //  was ST7735_DISPON: the usermod turns the\n"
+        "                                    //  panel on itself, once it has a frame.\n"
+        "                                    //  NOP rather than a deleted entry, so the\n"
+        "                                    //  table keeps its shape - see"
+        " pio-scripts/tft_espi_c3_fixes.py\n",
+        True,
+      ),
       (
         "SWRESET waits 120 ms, not 150 ms",
         "      150,                    //     150 ms delay\n",
