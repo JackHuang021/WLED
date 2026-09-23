@@ -59,13 +59,20 @@ class HmiGesture {
     void setRepeatMs(uint16_t ms)      { _repeatFastMs = ms ? ms : HMI_REPEAT_FAST_MS; }
 
     /*
-     * End the adjustment, so the next long press brightens instead of carrying
-     * the last one's direction into it. The direction is a property of one
-     * adjustment rather than a mode the button sits in, and the brightness view
-     * is what an adjustment is - so the caller resets this when that view leaves
-     * the screen. This class has no view to watch, deliberately.
+     * End the adjustment, so the next long press starts a fresh one instead of
+     * carrying the last one's direction into it. The direction is a property of
+     * one adjustment rather than a mode the button sits in, and the brightness
+     * view is what an adjustment is - so the caller resets this when that view
+     * leaves the screen. This class has no view to watch, deliberately.
+     *
+     * `dimNext` is for the one level with nothing above it. The press itself
+     * inverts whatever is stored here, so a strip already at full brightness
+     * would be handed a step that clamps at 255 and changes nothing: the button
+     * would look dead at exactly the level the user is most likely to press
+     * from the top at. Down is the only way that level can move, so the caller
+     * says so - it knows the brightness, this class deliberately does not.
      */
-    void resetDirection() { _dir = -1; }
+    void resetDirection(bool dimNext = false) { _dir = dimNext ? 1 : -1; }
 
   private:
     bool     _pressedBefore = false;
@@ -75,7 +82,8 @@ class HmiGesture {
     uint32_t _repeatAt = 0;      // when the last repeat fired
     // Starts at -1 so that the first long press flips it to +1 and brightens,
     // which is what WLED's own button 1 does (button.cpp:309). resetDirection()
-    // puts it back here, which is what makes every adjustment start brighter.
+    // puts it back here between adjustments, which is what makes them start
+    // brighter - except at full brightness, where it stores +1 instead.
     int8_t   _dir = -1;
     uint8_t  _repeats = 0;
     uint16_t _doubleMs = 350;    // WLED_DOUBLE_PRESS; 0 disables double press

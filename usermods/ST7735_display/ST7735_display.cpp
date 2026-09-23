@@ -1347,8 +1347,14 @@ class St7735DisplayUsermod : public Usermod {
        * (power, preset) replacing it. It reads the view rather than counting
        * presses, so a hold that is still going - repeats call showOverlay() and
        * keep the view up - cannot reset itself mid-ramp.
+       *
+       * A strip already at full brightness is the exception, and the level a
+       * fresh press is most likely to arrive at: there is nothing above 100%
+       * for it to brighten into, so the step would clamp at 255 and the button
+       * would look dead for as long as the user kept holding it. Coming down is
+       * the only way it can move, so that is the direction the reset asks for.
        */
-      if (view.overlay() != HmiOverlay::BRIGHTNESS) gesture.resetDirection();
+      if (view.overlay() != HmiOverlay::BRIGHTNESS) gesture.resetDirection(bri == 255);
 
       IPAddress currentIp = apActive ? WiFi.softAPIP() : WLEDNetwork.localIP();
       int16_t quality = WLED_CONNECTED ? getSignalQuality(WiFi.RSSI()) : -1;
